@@ -9,19 +9,12 @@ name: satudata
 
 x-satudata: &satudata
   image: satudata:latest
-  build:
-    context: .
-    dockerfile: Dockerfile
   env_file: .env.docker
   restart: unless-stopped
-  # Lets the containers reach services running on the host (Redis, MySQL)
-  # as `host.docker.internal`.
   extra_hosts:
     - "host.docker.internal:host-gateway"
   volumes:
-    # Uploaded files (infografis + Produk Statistik OPD) and framework files.
-    # Point STORAGE_PATH at the CURRENT app's storage dir to keep existing uploads.
-    - ${STORAGE_PATH:-./storage}:/var/www/html/storage
+    - ${STORAGE_PATH:-/var/www/satudata/storage}:/var/www/html/storage
   logging:
     driver: json-file
     options:
@@ -29,11 +22,14 @@ x-satudata: &satudata
       max-file: "3"
 
 services:
-  # Web: nginx + php-fpm. Only reachable from the host (127.0.0.1); the host
-  # nginx proxies public traffic to it.
+  # Web: nginx + php-fpm. Builds the image once.
   app:
     <<: *satudata
     container_name: satudata_app
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
     ports:
       - "127.0.0.1:${APP_PORT:-8080}:80"
     environment:
@@ -45,17 +41,21 @@ services:
       retries: 3
       start_period: 20s
 
-  # Executes queued jobs (the CKAN/Berita cache warm-up). Recycles itself every
-  # hour / 500 jobs to release memory; `restart` brings it straight back.
+  # Worker: reuses the image built by app
   worker:
     <<: *satudata
     container_name: satudata_worker
+    depends_on:
+      app:
+        condition: service_started
     command: ["php", "artisan", "queue:work", "redis", "--sleep=3", "--tries=3", "--timeout=600", "--max-time=3600", "--max-jobs=500"]
     stop_grace_period: 60s
 
-  # Fires scheduled tasks (routes/console.php) every minute: dispatches the
-  # cache warm-up job every 5 minutes. Replaces the usual `* * * * * schedule:run` cron.
+  # Scheduler: reuses the image built by app
   scheduler:
     <<: *satudata
     container_name: satudata_scheduler
+    depends_on:
+      app:
+        condition: service_started
     command: ["php", "artisan", "schedule:work"]
