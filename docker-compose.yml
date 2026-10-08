@@ -1,0 +1,61 @@
+# Satu Data Muara Enim - app + queue worker + scheduler.
+# Redis and the database are NOT started here: the existing Redis on the host
+# is used (see .env.docker.example and docs/docker-deployment.md).
+#
+#   cp .env.docker.example .env.docker   # then edit it
+#   docker compose up -d --build
+
+name: satudata
+
+x-satudata: &satudata
+  image: satudata:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env.docker
+  restart: unless-stopped
+  # Lets the containers reach services running on the host (Redis, MySQL)
+  # as `host.docker.internal`.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    # Uploaded files (infografis + Produk Statistik OPD) and framework files.
+    # Point STORAGE_PATH at the CURRENT app's storage dir to keep existing uploads.
+    - ${STORAGE_PATH:-./storage}:/var/www/html/storage
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # Web: nginx + php-fpm. Only reachable from the host (127.0.0.1); the host
+  # nginx proxies public traffic to it.
+  app:
+    <<: *satudata
+    container_name: satudata_app
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:80"
+    environment:
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Executes queued jobs (the CKAN/Berita cache warm-up). Recycles itself every
+  # hour / 500 jobs to release memory; `restart` brings it straight back.
+  worker:
+    <<: *satudata
+    container_name: satudata_worker
+    command: ["php", "artisan", "queue:work", "redis", "--sleep=3", "--tries=3", "--timeout=600", "--max-time=3600", "--max-jobs=500"]
+    stop_grace_period: 60s
+
+  # Fires scheduled tasks (routes/console.php) every minute: dispatches the
+  # cache warm-up job every 5 minutes. Replaces the usual `* * * * * schedule:run` cron.
+  scheduler:
+    <<: *satudata
+    container_name: satudata_scheduler
+    command: ["php", "artisan", "schedule:work"]

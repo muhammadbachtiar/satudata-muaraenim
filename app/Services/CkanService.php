@@ -9,6 +9,19 @@ class CkanService
 {
     private string $baseUrl = 'https://opendata.muaraenimkab.go.id/';
 
+    /** TTL (seconds) for entries cached on-demand by a visitor request. */
+    private const TTL = 300;
+
+    /**
+     * TTL (seconds) for entries written by the background warmer. It is longer
+     * than the warm interval (5 min) so a failed run does not leave the cache
+     * empty: visitors keep getting the last good data instead of waiting on CKAN.
+     */
+    public const WARM_TTL = 900;
+
+    /** Abort a warm run after this many consecutive CKAN failures (CKAN is probably down). */
+    private const WARM_MAX_CONSECUTIVE_FAILURES = 5;
+
     /**
      * Execute a curl request to the CKAN API.
      */
@@ -66,25 +79,28 @@ class CkanService
      */
     public function organizationList(): array
     {
-        return Cache::remember('ckan_org_list', 300, function () {
-            $response = $this->request('api/3/action/organization_list', [
-                'all_fields' => 'true',
-                'include_dataset_count' => 'true',
-                'limit' => 1000,
-            ]);
+        return Cache::remember('ckan_org_list', self::TTL, fn () => $this->fetchOrganizations());
+    }
 
-            $result = $response['result'] ?? [];
+    /**
+     * Fetch organizations from CKAN without touching the cache.
+     * Returns an empty array when CKAN is unreachable.
+     */
+    private function fetchOrganizations(): array
+    {
+        $response = $this->request('api/3/action/organization_list', [
+            'all_fields' => 'true',
+            'include_dataset_count' => 'true',
+            'limit' => 1000,
+        ]);
 
-            // Don't cache empty results caused by API failures
-            if (empty($result) && empty($response['success'])) {
-                Log::warning('CKAN organizationList returned empty — not caching failure');
-                Cache::forget('ckan_org_list');
-            }
+        $result = $response['result'] ?? [];
 
-            $result = $this->mergeOrganizationsFromDatasetFacets($result);
+        if (empty($result) && empty($response['success'])) {
+            Log::warning('CKAN organizationList returned empty');
+        }
 
-            return $result;
-        });
+        return $this->mergeOrganizationsFromDatasetFacets($result);
     }
 
     /**
@@ -153,10 +169,17 @@ class CkanService
      */
     public function packageList(): array
     {
-        return Cache::remember('ckan_package_list', 300, function () {
-            $response = $this->request('api/3/action/package_list');
-            return $response['result'] ?? [];
-        });
+        return Cache::remember('ckan_package_list', self::TTL, fn () => $this->fetchPackageList());
+    }
+
+    /**
+     * Fetch all dataset slugs from CKAN without touching the cache.
+     */
+    private function fetchPackageList(): array
+    {
+        $response = $this->request('api/3/action/package_list');
+
+        return (array) ($response['result'] ?? []);
     }
 
     /**
@@ -237,17 +260,26 @@ class CkanService
      */
     public function packageShow(string $id): ?array
     {
-        $cacheKey = 'ckan_pkg_' . md5($id);
+        return Cache::remember($this->packageCacheKey($id), self::TTL, fn () => $this->fetchPackage($id));
+    }
 
-        return Cache::remember($cacheKey, 300, function () use ($id) {
-            $response = $this->request('api/3/action/package_show', ['id' => $id]);
+    private function packageCacheKey(string $id): string
+    {
+        return 'ckan_pkg_' . md5($id);
+    }
 
-            if (empty($response['success']) || $response['result'] === null) {
-                return null;
-            }
+    /**
+     * Fetch one dataset from CKAN without touching the cache.
+     */
+    private function fetchPackage(string $id): ?array
+    {
+        $response = $this->request('api/3/action/package_show', ['id' => $id]);
 
-            return $response['result'];
-        });
+        if (empty($response['success']) || ($response['result'] ?? null) === null) {
+            return null;
+        }
+
+        return $response['result'];
     }
 
     /**
@@ -315,5 +347,67 @@ class CkanService
                 'dataset_count'      => count($packageSlugs),
             ];
         });
+    }
+
+    /**
+     * Refresh the CKAN cache in the background (called by the queue worker).
+     *
+     * Fetches organizations, the dataset list and dataset details, then writes
+     * them with WARM_TTL. Existing cache entries are only overwritten on a
+     * successful fetch, so a CKAN outage never replaces good data with nothing.
+     * Visitor requests then read from the cache instead of calling CKAN.
+     *
+     * @return array{organizations:int,datasets:int,failures:int,aborted:bool}
+     */
+    public function warm(int $maxDatasets = 500): array
+    {
+        $report = ['organizations' => 0, 'datasets' => 0, 'failures' => 0, 'aborted' => false];
+
+        $organizations = $this->fetchOrganizations();
+        if ($organizations !== []) {
+            Cache::put('ckan_org_list', $organizations, self::WARM_TTL);
+            $report['organizations'] = count($organizations);
+        } else {
+            $report['failures']++;
+        }
+
+        $slugs = $this->fetchPackageList();
+        if ($slugs === []) {
+            $report['failures']++;
+
+            return $report;
+        }
+        Cache::put('ckan_package_list', $slugs, self::WARM_TTL);
+
+        $consecutiveFailures = 0;
+        foreach (array_slice($slugs, 0, max(0, $maxDatasets)) as $slug) {
+            $slug = (string) $slug;
+            $dataset = $this->fetchPackage($slug);
+
+            if ($dataset === null) {
+                $report['failures']++;
+
+                if (++$consecutiveFailures >= self::WARM_MAX_CONSECUTIVE_FAILURES) {
+                    $report['aborted'] = true;
+                    Log::warning('CKAN warm aborted after consecutive failures', ['failures' => $consecutiveFailures]);
+                    break;
+                }
+
+                continue;
+            }
+
+            $consecutiveFailures = 0;
+            Cache::put($this->packageCacheKey($slug), $dataset, self::WARM_TTL);
+            $report['datasets']++;
+        }
+
+        if ($organizations !== []) {
+            Cache::put('ckan_site_stats', [
+                'organization_count' => count($organizations),
+                'dataset_count'      => count($slugs),
+            ], self::WARM_TTL);
+        }
+
+        return $report;
     }
 }

@@ -1,0 +1,36 @@
+# Keep secrets, VCS data and local state out of the image.
+.git
+.gitignore
+.gitattributes
+.editorconfig
+.roo
+
+# Environment files must never be baked into an image layer.
+.env
+.env.*
+
+# Rebuilt inside the image / provided at runtime.
+vendor
+node_modules
+public/build
+public/hot
+public/storage
+bootstrap/cache/*.php
+
+# Runtime state lives in bind mounts (storage, database files).
+storage
+docker-data
+database/*.sqlite
+database/*.sqlite-*
+
+# Not needed in production.
+tests
+docs
+phpunit.xml
+*.md
+*.log
+
+# Docker files themselves.
+Dockerfile
+docker-compose*.yml
+.dockerignore

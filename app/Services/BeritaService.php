@@ -14,6 +14,18 @@ class BeritaService
 
     private int $villageId = 21;
 
+    /** TTL (seconds) for entries cached on-demand by a visitor request. */
+    private const TTL = 300;
+
+    /** TTL (seconds) for entries written by the background warmer (see CkanService::WARM_TTL). */
+    public const WARM_TTL = 900;
+
+    /**
+     * [page, page_size] combinations requested by the public pages:
+     * home (3), publikasi overview (6) and publikasi?type=berita (12).
+     */
+    private const WARM_LISTS = [[1, 3], [1, 6], [1, 12]];
+
     private function request(string $url, array $headers = []): array
     {
         $ch = curl_init();
@@ -65,15 +77,7 @@ class BeritaService
         $pageSize = max(1, $pageSize);
         $cacheKey = "berita_list_{$page}_{$pageSize}";
 
-        $payload = Cache::remember($cacheKey, 300, function () use ($page, $pageSize) {
-            $url = $this->baseUrl . '?' . http_build_query([
-                'page' => $page,
-                'page_size' => $pageSize,
-                'with' => 'category',
-            ]);
-
-            return $this->request($url, ['x-village-id: ' . $this->villageId]);
-        });
+        $payload = Cache::remember($cacheKey, self::TTL, fn () => $this->fetchListPayload($page, $pageSize));
 
         $items = collect($payload['data'] ?? [])
             ->map(fn(array $item) => $this->normalizeListItem($item))
@@ -97,6 +101,46 @@ class BeritaService
     public function latest(int $limit = 3): array
     {
         return $this->list(1, $limit)->items();
+    }
+
+    /**
+     * Fetch one page of articles from the Berita API without touching the cache.
+     */
+    private function fetchListPayload(int $page, int $pageSize): array
+    {
+        $url = $this->baseUrl . '?' . http_build_query([
+            'page' => $page,
+            'page_size' => $pageSize,
+            'with' => 'category',
+        ]);
+
+        return $this->request($url, ['x-village-id: ' . $this->villageId]);
+    }
+
+    /**
+     * Refresh the article lists in the background (called by the queue worker).
+     * An entry is only overwritten when the API answered successfully.
+     *
+     * @return array{lists:int,failures:int}
+     */
+    public function warm(): array
+    {
+        $report = ['lists' => 0, 'failures' => 0];
+
+        foreach (self::WARM_LISTS as [$page, $pageSize]) {
+            $payload = $this->fetchListPayload($page, $pageSize);
+
+            if (!is_array($payload['data'] ?? null)) {
+                $report['failures']++;
+
+                continue;
+            }
+
+            Cache::put("berita_list_{$page}_{$pageSize}", $payload, self::WARM_TTL);
+            $report['lists']++;
+        }
+
+        return $report;
     }
 
     public function detail(string $slug): ?array
