@@ -12,8 +12,9 @@ x-satudata: &satudata
   env_file: .env.docker
   restart: unless-stopped
   dns:
+    - 27.50.20.21
+    - 27.50.30.21
     - 8.8.8.8
-    - 1.1.1.1
   extra_hosts:
     - "host.docker.internal:host-gateway"
   volumes:
@@ -25,7 +26,7 @@ x-satudata: &satudata
       max-file: "3"
 
 services:
-  # Web: nginx + php-fpm. Builds the image once.
+  # Web: nginx + php-fpm
   app:
     <<: *satudata
     container_name: satudata_app
@@ -34,7 +35,7 @@ services:
       dockerfile: Dockerfile
       network: host
     ports:
-      - "127.0.0.1:${APP_PORT:-8080}:80"
+      - "127.0.0.1:8080:80"
     environment:
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
     healthcheck:
