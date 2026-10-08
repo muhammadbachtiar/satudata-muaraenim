@@ -17,6 +17,8 @@ x-satudata: &satudata
     - 8.8.8.8
   extra_hosts:
     - "host.docker.internal:host-gateway"
+    - "opendata.muaraenimkab.go.id:103.147.245.26"
+    - "desa-api.muaraenimkab.go.id:103.78.208.230"
   volumes:
     - ${STORAGE_PATH:-/var/www/satudata/storage}:/var/www/html/storage
   logging:
