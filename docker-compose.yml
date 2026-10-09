@@ -11,14 +11,7 @@ x-satudata: &satudata
   image: satudata:latest
   env_file: .env.docker
   restart: unless-stopped
-  dns:
-    - 27.50.20.21
-    - 27.50.30.21
-    - 8.8.8.8
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-    - "opendata.muaraenimkab.go.id:103.147.245.26"
-    - "desa-api.muaraenimkab.go.id:103.78.208.230"
+  network_mode: "host"
   volumes:
     - ${STORAGE_PATH:-/var/www/satudata/storage}:/var/www/html/storage
   logging:
@@ -36,12 +29,10 @@ services:
       context: .
       dockerfile: Dockerfile
       network: host
-    ports:
-      - "127.0.0.1:8080:80"
     environment:
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/up"]
       interval: 30s
       timeout: 5s
       retries: 3
