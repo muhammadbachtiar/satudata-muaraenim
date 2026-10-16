@@ -129,12 +129,20 @@ Tuning php-fpm lewat env di `.env.docker`/compose: `FPM_MAX_CHILDREN`, `FPM_STAR
 ## Cara kerja warm-up cache
 
 1. `scheduler` memicu `WarmExternalCache` tiap 5 menit (`routes/console.php`).
-2. Job masuk antrean Redis, `worker` mengeksekusinya: mengambil organisasi, daftar dataset,
-   detail dataset (maks. 500) dari CKAN dan daftar berita dari API Berita.
+2. Job masuk antrean Redis, `worker` mengeksekusinya:
+   * `organization_list` (+ facet `package_search`) -> `ckan_org_list`
+   * `package_search?q=*:*&sort=metadata_modified desc&rows=500&start=N` (±620 dataset = 2 request).
+     Dari hasil ini ditulis halaman listing home (`ckan_browse_6_0`), semua halaman
+     `/dataset` tanpa kata kunci (`ckan_browse_12_{start}`) dan cache `package_show`
+     tiap dataset (`ckan_pkg_{md5}`, berdasarkan `name` dan `id`).
+   * daftar berita dari API Berita.
 3. Hasil ditulis ke cache dengan TTL 15 menit. Entri hanya ditimpa jika fetch **berhasil**,
    sehingga saat CKAN down pengunjung tetap mendapat data terakhir yang baik.
-4. Request pengunjung membaca cache. Jika cache kosong/kedaluwarsa, perilakunya sama
-   seperti sebelumnya (fetch langsung, TTL 5 menit).
+4. Request pengunjung membaca cache. Jika cache kosong/kedaluwarsa, halaman diambil langsung
+   dengan **satu** `package_search` (TTL 5 menit; jika gagal, hasil kosong di-cache 30 detik).
 
-Pencarian dengan kata kunci melakukan `package_show` untuk setiap dataset yang belum
-ada di cache; karena detail dataset sudah di-warm, pencarian jadi jauh lebih cepat.
+Pencarian dengan kata kunci (`/dataset?q=...`) memakai satu `package_search` per halaman:
+kata kunci dibersihkan dari sintaks Solr, setiap kata harus cocok utuh atau sebagai awalan
+(`sekol` -> `sekolah`), hasil diurutkan `score desc, metadata_modified desc` dan di-cache
+5 menit per kata kunci + halaman (`ckan_search_{md5}_{rows}_{start}`). Dataset di hasil
+pencarian juga mengisi cache `package_show`, jadi membuka detailnya tidak memanggil CKAN lagi.

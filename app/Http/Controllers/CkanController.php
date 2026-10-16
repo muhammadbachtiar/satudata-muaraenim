@@ -28,7 +28,7 @@ class CkanController extends Controller
     {
         $stats = $this->ckan->siteStats();
         $organizations = $this->ckan->organizationList();
-        $recentDatasets = $this->ckan->getDatasets(6, 0);
+        $recentDatasets = $this->ckan->getDatasets(CkanService::HOME_LIMIT, 0);
 
         $beritaList = $this->berita->latest(3);
         $infografisList = Publication::published()->infografis()->orderBy('published_at', 'desc')->take(6)->get();
@@ -51,9 +51,13 @@ class CkanController extends Controller
      */
     public function search(Request $request)
     {
-        $query = $request->input('q', '*');
+        // '*' = no keyword (list everything). Non-string input (e.g. ?q[]=x) is ignored.
+        $query = $request->input('q');
+        $query = is_string($query) ? mb_substr(trim($query), 0, 100) : '';
+        $query = $query === '' ? '*' : $query;
+
         $page = max(1, (int) $request->input('page', 1));
-        $rows = 12;
+        $rows = CkanService::PAGE_SIZE;
         $start = ($page - 1) * $rows;
 
         $result = $this->ckan->searchDatasets($query, $rows, $start);

@@ -30,7 +30,8 @@ class WarmExternalCache implements ShouldQueue, ShouldBeUnique
     /** Do not queue a second warm-up while one is running (> $timeout). */
     public int $uniqueFor = 660;
 
-    public function __construct(public int $maxDatasets = 500)
+    /** Safety cap on datasets fetched (package_search, 500 per request). */
+    public function __construct(public int $maxDatasets = 5000)
     {
     }
 

@@ -19,8 +19,40 @@ class CkanService
      */
     public const WARM_TTL = 900;
 
-    /** Abort a warm run after this many consecutive CKAN failures (CKAN is probably down). */
-    private const WARM_MAX_CONSECUTIVE_FAILURES = 5;
+    /**
+     * TTL (seconds) of the empty result cached after a failed package_search, so
+     * an unreachable CKAN is not called again by every visitor.
+     */
+    private const FAILURE_TTL = 30;
+
+    /** Datasets per page on /dataset (CkanController::search). */
+    public const PAGE_SIZE = 12;
+
+    /** Datasets shown on the home page ("Dataset Terbaru"). */
+    public const HOME_LIMIT = 6;
+
+    /** Rows per package_search call made by the warmer (~2.7 KB per dataset). */
+    private const WARM_BATCH_SIZE = 500;
+
+    /**
+     * Listing pages written by the warmer: [rows per page, max pages (null = all)].
+     * They must match the searchDatasets('*', rows, start) calls of the pages.
+     */
+    private const WARM_LISTINGS = [
+        [self::HOME_LIMIT, 1],
+        [self::PAGE_SIZE, null],
+    ];
+
+    /** Sort order of a listing without keyword: newest first. */
+    private const BROWSE_SORT = 'metadata_modified desc';
+
+    /** Sort order of a keyword search: most relevant first, newest on ties. */
+    private const SEARCH_SORT = 'score desc, metadata_modified desc';
+
+    /** Maximum number of keywords taken from the visitor's query. */
+    private const MAX_SEARCH_TERMS = 8;
+
+    private const EMPTY_RESULT = ['count' => 0, 'results' => []];
 
     /**
      * Execute a curl request to the CKAN API.
@@ -164,99 +196,146 @@ class CkanService
     }
 
     /**
-     * Get all dataset slugs via package_list.
-     * (package_search is broken on this CKAN instance — Solr returns 0)
+     * Latest datasets (home page), newest first.
+     *
+     * @return array{count:int,results:array}
      */
-    public function packageList(): array
+    public function getDatasets(int $limit = self::HOME_LIMIT, int $offset = 0): array
     {
-        return Cache::remember('ckan_package_list', self::TTL, fn () => $this->fetchPackageList());
+        return $this->searchDatasets('*', $limit, $offset);
     }
 
     /**
-     * Fetch all dataset slugs from CKAN without touching the cache.
+     * List or search datasets with CKAN package_search (one request per page).
+     *
+     * An empty query or '*' lists every dataset, newest first. Otherwise every
+     * keyword must match as a whole word or as a word prefix ("sekol" finds
+     * "sekolah"), with title matches ranked first.
+     *
+     * Listing pages are written by the background warmer; keyword searches are
+     * cached on-demand for TTL seconds.
+     *
+     * @return array{count:int,results:array}
      */
-    private function fetchPackageList(): array
+    public function searchDatasets(string $query, int $limit = self::PAGE_SIZE, int $offset = 0): array
     {
-        $response = $this->request('api/3/action/package_list');
+        $limit = max(1, $limit);
+        $offset = max(0, $offset);
+        $terms = $this->searchTerms($query);
 
-        return (array) ($response['result'] ?? []);
+        if ($terms === []) {
+            return $this->rememberSearch(
+                $this->browseCacheKey($limit, $offset),
+                fn () => $this->fetchSearch('*:*', self::BROWSE_SORT, $limit, $offset)
+            );
+        }
+
+        return $this->rememberSearch(
+            'ckan_search_' . md5(implode(' ', $terms)) . "_{$limit}_{$offset}",
+            fn () => $this->fetchSearch($this->solrQuery($terms), self::SEARCH_SORT, $limit, $offset)
+        );
     }
 
     /**
-     * Get multiple datasets with full details.
-     * Uses package_list + package_show since package_search is broken.
+     * Return a cached search page, or fetch and cache it. The datasets of a
+     * freshly fetched page also prime the package_show cache (without replacing
+     * entries written by the warmer), so opening one of them needs no request.
+     *
+     * @return array{count:int,results:array}
      */
-    public function getDatasets(int $limit = 20, int $offset = 0): array
+    private function rememberSearch(string $key, callable $fetch): array
     {
-        $allSlugs = $this->packageList();
-        $total = count($allSlugs);
+        $cached = Cache::get($key);
 
-        // Slice for pagination
-        $slugs = array_slice($allSlugs, $offset, $limit);
+        if (is_array($cached)) {
+            return $cached;
+        }
 
-        $datasets = [];
-        foreach ($slugs as $slug) {
-            $ds = $this->packageShow($slug);
-            if ($ds) {
-                $datasets[] = $ds;
-            }
+        $result = $fetch();
+
+        if ($result === null) {
+            Cache::put($key, self::EMPTY_RESULT, self::FAILURE_TTL);
+
+            return self::EMPTY_RESULT;
+        }
+
+        Cache::put($key, $result, self::TTL);
+        $this->cachePackages($result['results'], self::TTL, overwrite: false);
+
+        return $result;
+    }
+
+    /**
+     * Call package_search without touching the cache. Returns null on failure.
+     *
+     * @return array{count:int,results:array}|null
+     */
+    private function fetchSearch(string $solrQuery, string $sort, int $rows, int $start): ?array
+    {
+        $response = $this->request('api/3/action/package_search', [
+            'q'     => $solrQuery,
+            'sort'  => $sort,
+            'rows'  => $rows,
+            'start' => $start,
+            'facet' => 'false',
+        ]);
+
+        $results = $response['result']['results'] ?? null;
+
+        if (empty($response['success']) || !is_array($results)) {
+            return null;
         }
 
         return [
-            'count'   => $total,
-            'results' => $datasets,
+            'count'   => (int) ($response['result']['count'] ?? 0),
+            'results' => array_values($results),
         ];
     }
 
     /**
-     * Search datasets by keyword.
-     * Since package_search Solr is broken, we filter package_list + package_show locally.
+     * Split the visitor's query into lowercase words. Everything except letters
+     * and digits is dropped, so Solr syntax (":", "(", quotes...) never reaches
+     * CKAN, which answers 409 on an invalid query.
+     *
+     * @return list<string>
      */
-    public function searchDatasets(string $query, int $limit = 12, int $offset = 0): array
+    private function searchTerms(string $query): array
     {
-        $allSlugs = $this->packageList();
+        $clean = preg_replace('/[^\p{L}\p{N}]+/u', ' ', mb_strtolower($query, 'UTF-8')) ?? '';
 
-        // If searching with a real query (not wildcard), filter slugs that match
-        if ($query !== '*' && $query !== '') {
-            $q = strtolower($query);
-            $filtered = [];
-            foreach ($allSlugs as $slug) {
-                // First check if slug contains keyword
-                if (str_contains(strtolower($slug), str_replace(' ', '-', $q)) || str_contains(strtolower($slug), $q)) {
-                    $filtered[] = $slug;
-                    continue;
-                }
-                // Otherwise fetch and check title/notes
-                $ds = $this->packageShow($slug);
-                if ($ds && (
-                    str_contains(strtolower($ds['title'] ?? ''), $q) ||
-                    str_contains(strtolower($ds['notes'] ?? ''), $q)
-                )) {
-                    $filtered[] = $slug;
-                }
-            }
-            $allSlugs = $filtered;
-        }
+        $terms = array_map(
+            fn (string $term) => mb_substr($term, 0, 50, 'UTF-8'),
+            array_filter(explode(' ', $clean), fn (string $term) => $term !== '')
+        );
 
-        $total = count($allSlugs);
-        $slugs = array_slice($allSlugs, $offset, $limit);
+        return array_slice(array_values(array_unique($terms)), 0, self::MAX_SEARCH_TERMS);
+    }
 
-        $datasets = [];
-        foreach ($slugs as $slug) {
-            $ds = $this->packageShow($slug);
-            if ($ds) {
-                $datasets[] = $ds;
-            }
-        }
+    /**
+     * Build the Solr query: every word must match, as a whole word or a prefix.
+     * Title matches score highest, then whole-word matches. For ["sekolah", "dasar"]:
+     * title:(sekolah* AND dasar*)^4 OR text:(sekolah AND dasar)^2 OR text:(sekolah* AND dasar*)
+     *
+     * @param list<string> $terms
+     */
+    private function solrQuery(array $terms): string
+    {
+        $exact = implode(' AND ', $terms);
+        $prefix = implode(' AND ', array_map(fn (string $term) => $term . '*', $terms));
 
-        return [
-            'count'   => $total,
-            'results' => $datasets,
-        ];
+        return "title:({$prefix})^4 OR text:({$exact})^2 OR text:({$prefix})";
+    }
+
+    private function browseCacheKey(int $rows, int $start): string
+    {
+        return "ckan_browse_{$rows}_{$start}";
     }
 
     /**
      * Get a single package/dataset by ID or name.
+     *
+     * Normally served from the cache filled by the warmer or by a search page
+     * (package_search returns the same dict); only a cache miss calls package_show.
      */
     public function packageShow(string $id): ?array
     {
@@ -266,6 +345,34 @@ class CkanService
     private function packageCacheKey(string $id): string
     {
         return 'ckan_pkg_' . md5($id);
+    }
+
+    /**
+     * Cache dataset dicts under both their name and their id: dataset pages are
+     * opened by name, resource pages look the dataset up by package_id.
+     *
+     * @return int Number of datasets cached
+     */
+    private function cachePackages(array $datasets, int $ttl, bool $overwrite): int
+    {
+        $count = 0;
+
+        foreach ($datasets as $dataset) {
+            if (!is_array($dataset)) {
+                continue;
+            }
+
+            $ids = array_unique(array_filter([$dataset['name'] ?? null, $dataset['id'] ?? null]));
+
+            foreach ($ids as $id) {
+                $key = $this->packageCacheKey((string) $id);
+                $overwrite ? Cache::put($key, $dataset, $ttl) : Cache::add($key, $dataset, $ttl);
+            }
+
+            $count++;
+        }
+
+        return $count;
     }
 
     /**
@@ -284,26 +391,35 @@ class CkanService
 
     /**
      * Get a single resource by ID.
+     *
+     * Cached for TTL seconds on-demand (no background warmer writes this key).
+     * resource_show is a cheap single-row lookup, so a 5-minute TTL is fine.
      */
     public function resourceShow(string $id): ?array
     {
-        $response = $this->request('api/3/action/resource_show', ['id' => $id]);
+        return Cache::remember('ckan_resource_' . md5($id), self::TTL, function () use ($id) {
+            $response = $this->request('api/3/action/resource_show', ['id' => $id]);
 
-        if (empty($response['success']) || $response['result'] === null) {
-            return null;
-        }
+            if (empty($response['success']) || $response['result'] === null) {
+                return null;
+            }
 
-        return $response['result'];
+            return $response['result'];
+        });
     }
 
     /**
      * Get views for a resource.
+     *
+     * Rarely changes, so TTL matches the standard on-demand TTL.
      */
     public function resourceViewList(string $id): array
     {
-        $response = $this->request('api/3/action/resource_view_list', ['id' => $id]);
+        return Cache::remember('ckan_resource_views_' . md5($id), self::TTL, function () use ($id) {
+            $response = $this->request('api/3/action/resource_view_list', ['id' => $id]);
 
-        return $response['result'] ?? [];
+            return $response['result'] ?? [];
+        });
     }
 
     /**
@@ -334,34 +450,34 @@ class CkanService
     }
 
     /**
-     * Get aggregated site statistics.
+     * Get aggregated site statistics. Both values come from caches the warmer
+     * keeps filled (organization list and the first /dataset page).
      */
     public function siteStats(): array
     {
-        return Cache::remember('ckan_site_stats', 300, function () {
-            $organizations = $this->organizationList();
-            $packageSlugs = $this->packageList();
-
-            return [
-                'organization_count' => count($organizations),
-                'dataset_count'      => count($packageSlugs),
-            ];
-        });
+        return [
+            'organization_count' => count($this->organizationList()),
+            'dataset_count'      => $this->searchDatasets('*', self::PAGE_SIZE, 0)['count'],
+        ];
     }
 
     /**
      * Refresh the CKAN cache in the background (called by the queue worker).
      *
-     * Fetches organizations, the dataset list and dataset details, then writes
-     * them with WARM_TTL. Existing cache entries are only overwritten on a
-     * successful fetch, so a CKAN outage never replaces good data with nothing.
-     * Visitor requests then read from the cache instead of calling CKAN.
+     * 1. organization_list (+ package_search facets) -> ckan_org_list
+     * 2. package_search q=*:* newest first, WARM_BATCH_SIZE rows per call
+     *    (620 datasets = 2 requests), then from that single result set:
+     *    - every listing page of WARM_LISTINGS (home + /dataset without keyword)
+     *    - the package_show cache of every dataset, by name and by id
      *
-     * @return array{organizations:int,datasets:int,failures:int,aborted:bool}
+     * Entries are written with WARM_TTL and only after a successful fetch, so a
+     * CKAN outage never replaces good data with nothing.
+     *
+     * @return array{organizations:int,datasets:int,pages:int,failures:int,aborted:bool}
      */
-    public function warm(int $maxDatasets = 500): array
+    public function warm(int $maxDatasets = 5000): array
     {
-        $report = ['organizations' => 0, 'datasets' => 0, 'failures' => 0, 'aborted' => false];
+        $report = ['organizations' => 0, 'datasets' => 0, 'pages' => 0, 'failures' => 0, 'aborted' => false];
 
         $organizations = $this->fetchOrganizations();
         if ($organizations !== []) {
@@ -371,43 +487,73 @@ class CkanService
             $report['failures']++;
         }
 
-        $slugs = $this->fetchPackageList();
-        if ($slugs === []) {
-            $report['failures']++;
+        $maxDatasets = max(0, $maxDatasets);
+        $datasets = [];
+        $total = null;
 
-            return $report;
-        }
-        Cache::put('ckan_package_list', $slugs, self::WARM_TTL);
+        while (count($datasets) < min($total ?? PHP_INT_MAX, $maxDatasets)) {
+            $start = count($datasets);
+            $batch = $this->fetchSearch('*:*', self::BROWSE_SORT, min(self::WARM_BATCH_SIZE, $maxDatasets - $start), $start);
 
-        $consecutiveFailures = 0;
-        foreach (array_slice($slugs, 0, max(0, $maxDatasets)) as $slug) {
-            $slug = (string) $slug;
-            $dataset = $this->fetchPackage($slug);
-
-            if ($dataset === null) {
+            if ($batch === null) {
                 $report['failures']++;
-
-                if (++$consecutiveFailures >= self::WARM_MAX_CONSECUTIVE_FAILURES) {
-                    $report['aborted'] = true;
-                    Log::warning('CKAN warm aborted after consecutive failures', ['failures' => $consecutiveFailures]);
-                    break;
-                }
-
-                continue;
+                $report['aborted'] = true;
+                Log::warning('CKAN warm aborted: package_search failed', ['start' => $start]);
+                break;
             }
 
-            $consecutiveFailures = 0;
-            Cache::put($this->packageCacheKey($slug), $dataset, self::WARM_TTL);
-            $report['datasets']++;
+            $total = $batch['count'];
+
+            if ($batch['results'] === []) {
+                break;
+            }
+
+            array_push($datasets, ...$batch['results']);
         }
 
-        if ($organizations !== []) {
-            Cache::put('ckan_site_stats', [
-                'organization_count' => count($organizations),
-                'dataset_count'      => count($slugs),
-            ], self::WARM_TTL);
+        // The first package_search call failed: keep the existing cache untouched.
+        if ($total === null) {
+            return $report;
+        }
+
+        $report['datasets'] = $this->cachePackages($datasets, self::WARM_TTL, overwrite: true);
+
+        foreach (self::WARM_LISTINGS as [$rows, $maxPages]) {
+            $report['pages'] += $this->cacheListingPages($datasets, $total, $rows, $maxPages);
         }
 
         return $report;
+    }
+
+    /**
+     * Slice the warmed datasets into the pages searchDatasets('*', $rows, $start)
+     * reads. Stops at the first page whose rows were not all fetched (aborted
+     * run or maxDatasets reached); such pages are fetched on-demand instead.
+     *
+     * @return int Number of pages cached
+     */
+    private function cacheListingPages(array $datasets, int $total, int $rows, ?int $maxPages): int
+    {
+        $fetched = count($datasets);
+        $pages = 0;
+
+        for ($start = 0; $start === 0 || $start < $total; $start += $rows) {
+            if ($maxPages !== null && $pages >= $maxPages) {
+                break;
+            }
+
+            if ($fetched - $start < min($rows, $total - $start)) {
+                break;
+            }
+
+            Cache::put($this->browseCacheKey($rows, $start), [
+                'count'   => $total,
+                'results' => array_slice($datasets, $start, $rows),
+            ], self::WARM_TTL);
+
+            $pages++;
+        }
+
+        return $pages;
     }
 }

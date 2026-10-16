@@ -10,7 +10,7 @@ use Illuminate\Console\Command;
 class WarmExternalCacheCommand extends Command
 {
     protected $signature = 'cache:warm-external
-        {--max-datasets=500 : Maximum number of CKAN datasets whose details are cached}
+        {--max-datasets=5000 : Maximum number of CKAN datasets fetched with package_search}
         {--queue : Dispatch the job to the queue instead of running it in this process}';
 
     protected $description = 'Refresh the cached CKAN and Berita API responses';
@@ -36,7 +36,8 @@ class WarmExternalCacheCommand extends Command
             ['Source', 'Cached', 'Failures'],
             [
                 ['CKAN organizations', $ckanReport['organizations'], '-'],
-                ['CKAN datasets', $ckanReport['datasets'], $ckanReport['failures']],
+                ['CKAN datasets (package_show cache)', $ckanReport['datasets'], $ckanReport['failures']],
+                ['CKAN listing pages (home + /dataset)', $ckanReport['pages'], '-'],
                 ['Berita lists', $beritaReport['lists'], $beritaReport['failures']],
             ]
         );
