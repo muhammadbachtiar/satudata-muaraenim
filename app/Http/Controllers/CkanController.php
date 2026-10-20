@@ -37,13 +37,24 @@ class CkanController extends Controller
     }
 
     /**
-     * GET /instansi — Organizations list
+     * GET /instansi — Organizations list with search and pagination
      */
-    public function organizations()
+    public function organizations(Request $request)
     {
-        $organizations = $this->ckan->organizationList();
+        $query = $request->input('q');
+        $query = is_string($query) ? mb_substr(trim($query), 0, 100) : '';
 
-        return view('organizations', compact('organizations'));
+        $page = max(1, (int) $request->input('page', 1));
+        $limit = CkanService::ORG_PAGE_SIZE;
+        $offset = ($page - 1) * $limit;
+
+        $result = $this->ckan->searchOrganizations($query, $limit, $offset);
+
+        $organizations = $result['results'] ?? [];
+        $totalCount = $result['count'] ?? 0;
+        $totalPages = (int) ceil($totalCount / $limit);
+
+        return view('organizations', compact('organizations', 'query', 'page', 'totalPages', 'totalCount', 'limit'));
     }
 
     /**
@@ -54,19 +65,33 @@ class CkanController extends Controller
         // '*' = no keyword (list everything). Non-string input (e.g. ?q[]=x) is ignored.
         $query = $request->input('q');
         $query = is_string($query) ? mb_substr(trim($query), 0, 100) : '';
+
+        $orgFilter = $request->input('organization') ?: $request->input('org');
+        $orgFilter = is_string($orgFilter) ? mb_substr(trim($orgFilter), 0, 100) : null;
+
+        if (preg_match('/^organization:\s*([a-z0-9_-]+)$/i', $query, $m)) {
+            $orgFilter = $m[1];
+            $query = '*';
+        }
+
         $query = $query === '' ? '*' : $query;
 
         $page = max(1, (int) $request->input('page', 1));
         $rows = CkanService::PAGE_SIZE;
         $start = ($page - 1) * $rows;
 
-        $result = $this->ckan->searchDatasets($query, $rows, $start);
+        $result = $this->ckan->searchDatasets($query, $rows, $start, $orgFilter);
 
         $datasets = $result['results'] ?? [];
         $totalCount = $result['count'] ?? 0;
         $totalPages = (int) ceil($totalCount / $rows);
 
-        return view('datasets.search', compact('datasets', 'query', 'page', 'totalPages', 'totalCount', 'rows'));
+        $orgTitle = null;
+        if (!empty($orgFilter)) {
+            $orgTitle = $this->ckan->getOrganizationTitle($orgFilter);
+        }
+
+        return view('datasets.search', compact('datasets', 'query', 'page', 'totalPages', 'totalCount', 'rows', 'orgFilter', 'orgTitle'));
     }
 
     /**

@@ -28,6 +28,9 @@ class CkanService
     /** Datasets per page on /dataset (CkanController::search). */
     public const PAGE_SIZE = 12;
 
+    /** Organizations per page on /instansi (CkanController::organizations). */
+    public const ORG_PAGE_SIZE = 12;
+
     /** Datasets shown on the home page ("Dataset Terbaru"). */
     public const HOME_LIMIT = 6;
 
@@ -112,6 +115,92 @@ class CkanService
     public function organizationList(): array
     {
         return Cache::remember('ckan_org_list', self::TTL, fn () => $this->fetchOrganizations());
+    }
+
+    /**
+     * Search and paginate organizations.
+     *
+     * @return array{count: int, results: array}
+     */
+    public function searchOrganizations(string $query = '', int $limit = self::ORG_PAGE_SIZE, int $offset = 0): array
+    {
+        $limit = max(1, $limit);
+        $offset = max(0, $offset);
+        $cleanQuery = trim($query);
+
+        $all = $this->organizationList();
+
+        if ($cleanQuery === '') {
+            $totalCount = count($all);
+            $results = array_slice($all, $offset, $limit);
+
+            return [
+                'count'   => $totalCount,
+                'results' => array_values($results),
+            ];
+        }
+
+        $cacheKey = 'ckan_org_search_' . md5(mb_strtolower($cleanQuery, 'UTF-8')) . "_{$limit}_{$offset}";
+
+        return Cache::remember($cacheKey, self::TTL, function () use ($all, $cleanQuery, $limit, $offset) {
+            $q = mb_strtolower($cleanQuery, 'UTF-8');
+
+            $matches = array_values(array_filter($all, function ($org) use ($q) {
+                $title = mb_strtolower($org['title'] ?? '', 'UTF-8');
+                $name = mb_strtolower($org['name'] ?? '', 'UTF-8');
+                $desc = mb_strtolower($org['description'] ?? '', 'UTF-8');
+
+                return str_contains($title, $q) || str_contains($name, $q) || str_contains($desc, $q);
+            }));
+
+            // Fallback: if in-memory returned empty, call CKAN API organization_list with q parameter directly
+            if (empty($matches)) {
+                $direct = $this->fetchOrganizationsDirect($cleanQuery);
+                if (!empty($direct)) {
+                    $matches = $direct;
+                }
+            }
+
+            return [
+                'count'   => count($matches),
+                'results' => array_values(array_slice($matches, $offset, $limit)),
+            ];
+        });
+    }
+
+    /**
+     * Query CKAN organization_list directly with the q parameter.
+     */
+    private function fetchOrganizationsDirect(string $query): array
+    {
+        $response = $this->request('api/3/action/organization_list', [
+            'all_fields'            => 'true',
+            'include_dataset_count' => 'true',
+            'q'                     => $query,
+            'limit'                 => 1000,
+        ]);
+
+        $result = $response['result'] ?? [];
+        if (!is_array($result) || empty($response['success'])) {
+            return [];
+        }
+
+        return $this->mergeOrganizationsFromDatasetFacets($result);
+    }
+
+    /**
+     * Get organization title by name/slug.
+     */
+    public function getOrganizationTitle(string $slug): string
+    {
+        $all = $this->organizationList();
+        foreach ($all as $org) {
+            if (($org['name'] ?? '') === $slug) {
+                return $org['title'] ?? $org['display_name'] ?? $this->titleFromSlug($slug);
+            }
+        }
+
+        return $this->titleFromSlug($slug);
     }
 
     /**
@@ -217,22 +306,29 @@ class CkanService
      *
      * @return array{count:int,results:array}
      */
-    public function searchDatasets(string $query, int $limit = self::PAGE_SIZE, int $offset = 0): array
+    public function searchDatasets(string $query, int $limit = self::PAGE_SIZE, int $offset = 0, ?string $organization = null): array
     {
         $limit = max(1, $limit);
         $offset = max(0, $offset);
         $terms = $this->searchTerms($query);
+        $fq = !empty($organization) ? 'organization:"' . addcslashes($organization, '"\\') . '"' : null;
 
         if ($terms === []) {
+            $cacheKey = !empty($organization)
+                ? "ckan_browse_org_{$organization}_{$limit}_{$offset}"
+                : $this->browseCacheKey($limit, $offset);
+
             return $this->rememberSearch(
-                $this->browseCacheKey($limit, $offset),
-                fn () => $this->fetchSearch('*:*', self::BROWSE_SORT, $limit, $offset)
+                $cacheKey,
+                fn () => $this->fetchSearch('*:*', self::BROWSE_SORT, $limit, $offset, $fq)
             );
         }
 
+        $cacheKey = 'ckan_search_' . md5(implode(' ', $terms) . '_' . ($organization ?? '')) . "_{$limit}_{$offset}";
+
         return $this->rememberSearch(
-            'ckan_search_' . md5(implode(' ', $terms)) . "_{$limit}_{$offset}",
-            fn () => $this->fetchSearch($this->solrQuery($terms), self::SEARCH_SORT, $limit, $offset)
+            $cacheKey,
+            fn () => $this->fetchSearch($this->solrQuery($terms), self::SEARCH_SORT, $limit, $offset, $fq)
         );
     }
 
@@ -270,15 +366,21 @@ class CkanService
      *
      * @return array{count:int,results:array}|null
      */
-    private function fetchSearch(string $solrQuery, string $sort, int $rows, int $start): ?array
+    private function fetchSearch(string $solrQuery, string $sort, int $rows, int $start, ?string $fq = null): ?array
     {
-        $response = $this->request('api/3/action/package_search', [
+        $params = [
             'q'     => $solrQuery,
             'sort'  => $sort,
             'rows'  => $rows,
             'start' => $start,
             'facet' => 'false',
-        ]);
+        ];
+
+        if ($fq !== null && $fq !== '') {
+            $params['fq'] = $fq;
+        }
+
+        $response = $this->request('api/3/action/package_search', $params);
 
         $results = $response['result']['results'] ?? null;
 

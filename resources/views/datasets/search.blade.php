@@ -234,13 +234,20 @@
 <section class="page-hero">
     <div class="container">
         <h1>Dataset</h1>
-        @if($query !== '*')
+        @if(!empty($orgFilter) && $query !== '*')
+        <p>Hasil pencarian untuk <strong>"{{ $query }}"</strong> pada instansi: <strong>"{{ $orgTitle ?? $orgFilter }}"</strong></p>
+        @elseif(!empty($orgFilter))
+        <p>Menampilkan seluruh dataset dari instansi: <strong>"{{ $orgTitle ?? $orgFilter }}"</strong></p>
+        @elseif($query !== '*')
         <p>Hasil pencarian untuk: <strong>"{{ $query }}"</strong></p>
         @else
         <p>Jelajahi seluruh dataset yang tersedia di portal Satu Data Kabupaten Muara Enim</p>
         @endif
 
         <form action="/dataset" method="GET" class="search-form-hero">
+            @if(!empty($orgFilter))
+            <input type="hidden" name="organization" value="{{ $orgFilter }}" />
+            @endif
             <input type="text" name="q" value="{{ $query === '*' ? '' : $query }}" placeholder="Cari dataset..." />
             <button type="submit">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
@@ -257,8 +264,19 @@
 <section class="search-section">
     <div class="container">
         <div class="results-info">
-            Ditemukan <strong>{{ $totalCount }}</strong> dataset
-            @if($query !== '*') untuk "<strong>{{ $query }}</strong>"@endif
+            <div>
+                Ditemukan <strong>{{ $totalCount }}</strong> dataset
+                @if($query !== '*') untuk "<strong>{{ $query }}</strong>"@endif
+                @if(!empty($orgFilter))
+                dari instansi <strong>"{{ $orgTitle ?? $orgFilter }}"</strong>
+                @endif
+            </div>
+
+            @if(!empty($orgFilter))
+            <a href="/dataset{{ $query !== '*' ? '?q=' . urlencode($query) : '' }}" class="badge" style="background:var(--gold-muted); color:var(--gold); text-decoration:none; padding:0.35rem 0.75rem; font-size:0.75rem;">
+                ✕ Hapus filter instansi
+            </a>
+            @endif
         </div>
 
         <div class="dataset-grid">
@@ -295,14 +313,19 @@
         </div>
 
         @if($totalPages > 1)
+        @php
+        $pageParams = [];
+        if ($query !== '*') $pageParams['q'] = $query;
+        if (!empty($orgFilter)) $pageParams['organization'] = $orgFilter;
+        @endphp
         <div class="pagination">
             @if($page > 1)
-            <a href="?q={{ urlencode($query) }}&page={{ $page - 1 }}" class="page-btn">← Sebelumnya</a>
+            <a href="?{{ http_build_query(array_merge($pageParams, ['page' => $page - 1])) }}" class="page-btn">← Sebelumnya</a>
             @endif
             <span class="page-info">Halaman {{ $page }} dari {{ $totalPages }}</span>
-            @if($page < $totalPages) <a href="?q={{ urlencode($query) }}&page={{ $page + 1 }}" class="page-btn">
-                Selanjutnya →</a>
-                @endif
+            @if($page < $totalPages)
+            <a href="?{{ http_build_query(array_merge($pageParams, ['page' => $page + 1])) }}" class="page-btn">Selanjutnya →</a>
+            @endif
         </div>
         @endif
     </div>
