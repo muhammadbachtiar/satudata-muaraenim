@@ -114,7 +114,15 @@ class CkanService
      */
     public function organizationList(): array
     {
-        return Cache::remember('ckan_org_list', self::TTL, fn () => $this->fetchOrganizations());
+        $cached = Cache::get('ckan_org_list');
+
+        // Automatically invalidate stale cache if it was stored with only 56 items
+        if (is_array($cached) && count($cached) < 60) {
+            Cache::forget('ckan_org_list');
+            $cached = null;
+        }
+
+        return $cached ?? Cache::remember('ckan_org_list', self::TTL, fn () => $this->fetchOrganizations());
     }
 
     /**
@@ -209,19 +217,37 @@ class CkanService
      */
     private function fetchOrganizations(): array
     {
-        $response = $this->request('api/3/action/organization_list', [
-            'all_fields' => 'true',
-            'include_dataset_count' => 'true',
-            'limit' => 1000,
-        ]);
+        $organizations = [];
+        $offset = 0;
 
-        $result = $response['result'] ?? [];
+        while (true) {
+            $response = $this->request('api/3/action/organization_list', [
+                'all_fields'            => 'true',
+                'include_dataset_count' => 'true',
+                'offset'                => $offset,
+            ]);
 
-        if (empty($result) && empty($response['success'])) {
+            $batch = $response['result'] ?? [];
+
+            if (empty($batch) || !is_array($batch)) {
+                break;
+            }
+
+            $organizations = array_merge($organizations, $batch);
+
+            // CKAN caps all_fields organization_list at 25 per request
+            if (count($batch) < 25) {
+                break;
+            }
+
+            $offset += count($batch);
+        }
+
+        if (empty($organizations)) {
             Log::warning('CKAN organizationList returned empty');
         }
 
-        return $this->mergeOrganizationsFromDatasetFacets($result);
+        return $this->mergeOrganizationsFromDatasetFacets($organizations);
     }
 
     /**
