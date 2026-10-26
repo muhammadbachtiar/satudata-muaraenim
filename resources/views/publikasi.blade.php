@@ -283,6 +283,9 @@
             @if($publications->previousPageUrl())
             <a href="{{ $publications->previousPageUrl() }}" class="page-btn">← Sebelumnya</a>
             @endif
+
+            <span class="page-info">Halaman {{ $publications->currentPage() }}</span>
+
             @if($publications->nextPageUrl())
             <a href="{{ $publications->nextPageUrl() }}" class="page-btn">Selanjutnya →</a>
             @endif

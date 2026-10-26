@@ -139,7 +139,8 @@ class CkanController extends Controller
         $type = $request->input('type');
 
         if ($type === 'berita') {
-            $publications = $this->berita->list(max(1, (int) $request->input('page', 1)), 12);
+            $page = max(1, (int) $request->input('page', 1));
+            $publications = $this->berita->list($page, BeritaService::PAGE_SIZE);
 
             return view('publikasi', compact('publications', 'type'));
         }
@@ -148,7 +149,7 @@ class CkanController extends Controller
 
         if ($type === 'infografis') {
             $query->infografis();
-            $publications = $query->simplePaginate(12);
+            $publications = $query->simplePaginate(BeritaService::PAGE_SIZE);
         } else {
             $apiBerita = collect($this->berita->latest(6));
             $infografis = $query->infografis()->take(6)->get();

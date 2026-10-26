@@ -2,7 +2,9 @@
 
 namespace App\Services;
 
+use Illuminate\Contracts\Pagination\Paginator as PaginatorContract;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -14,6 +16,9 @@ class BeritaService
 
     private int $villageId = 21;
 
+    /** Default page size matching desa-api standard (?page=1&page_size=10). */
+    public const PAGE_SIZE = 12;
+
     /** TTL (seconds) for entries cached on-demand by a visitor request. */
     private const TTL = 300;
 
@@ -22,9 +27,9 @@ class BeritaService
 
     /**
      * [page, page_size] combinations requested by the public pages:
-     * home (3), publikasi overview (6) and publikasi?type=berita (12).
+     * home (3), publikasi overview (6) and publikasi?type=berita (10).
      */
-    private const WARM_LISTS = [[1, 3], [1, 6], [1, 12]];
+    private const WARM_LISTS = [[1, 3], [1, 6], [1, 10], [2, 10]];
 
     private function request(string $url, array $headers = []): array
     {
@@ -71,7 +76,7 @@ class BeritaService
         return $decoded;
     }
 
-    public function list(int $page = 1, int $pageSize = 12): LengthAwarePaginator
+    public function list(int $page = 1, int $pageSize = self::PAGE_SIZE): PaginatorContract
     {
         $page = max(1, $page);
         $pageSize = max(1, $pageSize);
@@ -83,12 +88,24 @@ class BeritaService
             ->map(fn(array $item) => $this->normalizeListItem($item))
             ->values();
 
-        $hasNext = !empty($payload['meta']['next_page_url']);
-        $total = (($page - 1) * $pageSize) + $items->count() + ($hasNext ? $pageSize : 0);
+        $total = $payload['meta']['total'] ?? $payload['total'] ?? null;
+        $hasNext = !empty($payload['meta']['next_page_url']) || count($items) >= $pageSize;
 
-        return new LengthAwarePaginator(
+        if ($total !== null) {
+            return new LengthAwarePaginator(
+                $items,
+                (int) $total,
+                $pageSize,
+                $page,
+                [
+                    'path' => request()->url(),
+                    'query' => request()->query(),
+                ]
+            );
+        }
+
+        $paginator = new Paginator(
             $items,
-            $total,
             $pageSize,
             $page,
             [
@@ -96,6 +113,9 @@ class BeritaService
                 'query' => request()->query(),
             ]
         );
+        $paginator->hasMorePagesWhen($hasNext);
+
+        return $paginator;
     }
 
     public function latest(int $limit = 3): array
