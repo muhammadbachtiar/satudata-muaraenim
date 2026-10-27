@@ -3,7 +3,6 @@
 namespace App\Services;
 
 use Illuminate\Contracts\Pagination\Paginator as PaginatorContract;
-use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -16,20 +15,20 @@ class BeritaService
 
     private int $villageId = 21;
 
-    /** Default page size matching desa-api standard (?page=1&page_size=10). */
+    /** Default page size matching publikasi grid layout (3 columns x 4 rows). */
     public const PAGE_SIZE = 12;
 
     /** TTL (seconds) for entries cached on-demand by a visitor request. */
     private const TTL = 300;
 
-    /** TTL (seconds) for entries written by the background warmer (see CkanService::WARM_TTL). */
+    /** TTL (seconds) for entries written by the background warmer. */
     public const WARM_TTL = 900;
 
-    /**
-     * [page, page_size] combinations requested by the public pages:
-     * home (3), publikasi overview (6) and publikasi?type=berita (10).
-     */
-    private const WARM_LISTS = [[1, 3], [1, 6], [1, 10], [2, 10]];
+    /** TTL (seconds) for page-to-cursor mappings (1 hour). */
+    private const CURSOR_TTL = 3600;
+
+    /** Maximum pages allowed to walk sequentially to prevent execution timeouts. */
+    private const MAX_PAGE_WALK = 30;
 
     private function request(string $url, array $headers = []): array
     {
@@ -76,33 +75,26 @@ class BeritaService
         return $decoded;
     }
 
+    /**
+     * Get paginated articles for a specific page number.
+     * Keeps standard ?page=1,2,3... URLs while internally resolving the upstream cursor.
+     */
     public function list(int $page = 1, int $pageSize = self::PAGE_SIZE): PaginatorContract
     {
         $page = max(1, $page);
         $pageSize = max(1, $pageSize);
-        $cacheKey = "berita_list_{$page}_{$pageSize}";
+        $cacheKey = "berita_list_page_{$page}_{$pageSize}";
 
-        $payload = Cache::remember($cacheKey, self::TTL, fn () => $this->fetchListPayload($page, $pageSize));
+        $payload = Cache::remember($cacheKey, self::TTL, fn () => $this->fetchPagePayload($page, $pageSize));
 
         $items = collect($payload['data'] ?? [])
             ->map(fn(array $item) => $this->normalizeListItem($item))
             ->values();
 
-        $total = $payload['meta']['total'] ?? $payload['total'] ?? null;
-        $hasNext = !empty($payload['meta']['next_page_url']) || count($items) >= $pageSize;
+        $hasNext = !empty($payload['meta']['next_page_url']) || !empty($payload['hasNext']);
 
-        if ($total !== null) {
-            return new LengthAwarePaginator(
-                $items,
-                (int) $total,
-                $pageSize,
-                $page,
-                [
-                    'path' => request()->url(),
-                    'query' => request()->query(),
-                ]
-            );
-        }
+        $query = request()->query();
+        unset($query['cursor']);
 
         $paginator = new Paginator(
             $items,
@@ -110,7 +102,7 @@ class BeritaService
             $page,
             [
                 'path' => request()->url(),
-                'query' => request()->query(),
+                'query' => $query,
             ]
         );
         $paginator->hasMorePagesWhen($hasNext);
@@ -124,22 +116,128 @@ class BeritaService
     }
 
     /**
-     * Fetch one page of articles from the Berita API without touching the cache.
+     * Fetch raw payload directly from upstream API using optional cursor.
      */
-    private function fetchListPayload(int $page, int $pageSize): array
+    private function fetchRaw(int $pageSize, ?string $cursor = null): array
     {
-        $url = $this->baseUrl . '?' . http_build_query([
-            'page' => $page,
+        $params = [
             'page_size' => $pageSize,
             'with' => 'category',
-        ]);
+        ];
+
+        if (!empty($cursor)) {
+            $params['cursor'] = $cursor;
+        }
+
+        $url = $this->baseUrl . '?' . http_build_query($params);
 
         return $this->request($url, ['x-village-id: ' . $this->villageId]);
     }
 
     /**
+     * Extract cursor string from upstream API page url.
+     */
+    private function extractCursor(?string $url): ?string
+    {
+        if (empty($url)) {
+            return null;
+        }
+
+        $parts = parse_url($url);
+        if (empty($parts['query'])) {
+            return null;
+        }
+
+        parse_str($parts['query'], $query);
+
+        return !empty($query['cursor']) ? (string) $query['cursor'] : null;
+    }
+
+    /**
+     * Fetch one page payload, resolving cursors if page > 1.
+     */
+    public function fetchPagePayload(int $page, int $pageSize): array
+    {
+        if ($page === 1) {
+            $payload = $this->fetchRaw($pageSize, null);
+            if (!empty($payload['success']) && is_array($payload['data'] ?? null)) {
+                $nextCursor = $this->extractCursor($payload['meta']['next_page_url'] ?? null);
+                if ($nextCursor) {
+                    Cache::put("berita_cursor_{$pageSize}_2", $nextCursor, self::CURSOR_TTL);
+                }
+            }
+
+            return $payload;
+        }
+
+        $cursor = Cache::get("berita_cursor_{$pageSize}_{$page}");
+        if (!$cursor) {
+            $cursor = $this->resolveCursorForPage($page, $pageSize);
+        }
+
+        if ($cursor === null) {
+            return [
+                'success' => true,
+                'data' => [],
+                'meta' => ['next_page_url' => null, 'prev_page_url' => null],
+                'hasNext' => false,
+            ];
+        }
+
+        $payload = $this->fetchRaw($pageSize, $cursor);
+        if (!empty($payload['success']) && is_array($payload['data'] ?? null)) {
+            $nextCursor = $this->extractCursor($payload['meta']['next_page_url'] ?? null);
+            if ($nextCursor) {
+                Cache::put("berita_cursor_{$pageSize}_" . ($page + 1), $nextCursor, self::CURSOR_TTL);
+            }
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Walk through cursors page-by-page from nearest cached point to target page.
+     */
+    private function resolveCursorForPage(int $targetPage, int $pageSize): ?string
+    {
+        if ($targetPage > self::MAX_PAGE_WALK) {
+            $targetPage = self::MAX_PAGE_WALK;
+        }
+
+        $startPage = 1;
+        $currentCursor = null;
+
+        for ($p = $targetPage - 1; $p >= 2; $p--) {
+            $cachedCursor = Cache::get("berita_cursor_{$pageSize}_{$p}");
+            if ($cachedCursor) {
+                $startPage = $p;
+                $currentCursor = $cachedCursor;
+                break;
+            }
+        }
+
+        for ($p = $startPage; $p < $targetPage; $p++) {
+            $payloadKey = "berita_list_page_{$p}_{$pageSize}";
+            $cursorForStep = $currentCursor;
+            $stepPayload = Cache::remember($payloadKey, self::TTL, function () use ($pageSize, $cursorForStep) {
+                return $this->fetchRaw($pageSize, $cursorForStep);
+            });
+
+            $nextCursor = $this->extractCursor($stepPayload['meta']['next_page_url'] ?? null);
+            if (!$nextCursor) {
+                return null;
+            }
+
+            Cache::put("berita_cursor_{$pageSize}_" . ($p + 1), $nextCursor, self::CURSOR_TTL);
+            $currentCursor = $nextCursor;
+        }
+
+        return $currentCursor;
+    }
+
+    /**
      * Refresh the article lists in the background (called by the queue worker).
-     * An entry is only overwritten when the API answered successfully.
+     * Warms home/overview lists and pages 1 to 6 for the publikasi berita page.
      *
      * @return array{lists:int,failures:int}
      */
@@ -147,17 +245,35 @@ class BeritaService
     {
         $report = ['lists' => 0, 'failures' => 0];
 
-        foreach (self::WARM_LISTS as [$page, $pageSize]) {
-            $payload = $this->fetchListPayload($page, $pageSize);
-
+        // 1. Warm home (3) & publikasi overview (6)
+        foreach ([3, 6] as $limit) {
+            $payload = $this->fetchRaw($limit, null);
             if (!is_array($payload['data'] ?? null)) {
                 $report['failures']++;
-
                 continue;
             }
-
-            Cache::put("berita_list_{$page}_{$pageSize}", $payload, self::WARM_TTL);
+            Cache::put("berita_list_page_1_{$limit}", $payload, self::WARM_TTL);
             $report['lists']++;
+        }
+
+        // 2. Warm publikasi?type=berita pages 1 through 6
+        $cursor = null;
+        for ($p = 1; $p <= 6; $p++) {
+            $payload = $this->fetchRaw(self::PAGE_SIZE, $cursor);
+            if (!is_array($payload['data'] ?? null)) {
+                $report['failures']++;
+                break;
+            }
+
+            Cache::put("berita_list_page_{$p}_" . self::PAGE_SIZE, $payload, self::WARM_TTL);
+            $report['lists']++;
+
+            $cursor = $this->extractCursor($payload['meta']['next_page_url'] ?? null);
+            if ($cursor) {
+                Cache::put("berita_cursor_" . self::PAGE_SIZE . "_" . ($p + 1), $cursor, self::CURSOR_TTL);
+            } else {
+                break;
+            }
         }
 
         return $report;
